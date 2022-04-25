@@ -7,7 +7,7 @@ import serial
 from std_msgs.msg import Float32
 
 if __name__ == '__main__':
-    ser = serial.Serial('/dev/ttyACM0')
+    ser = serial.Serial('/dev/ttyACM1')
     rospy.init_node('force_sensor', anonymous=True)
     pub = rospy.Publisher('force_resistance', Float32, queue_size=10)
     r = rospy.Rate(10) # 10hz

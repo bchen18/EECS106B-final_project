@@ -72,6 +72,64 @@ def lookup_transform(to_frame, from_frame='base', no_swap = False):
     return create_transform_matrix(rot, tag_pos)
 
 
+def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, gripper):
+    bridge = CvBridge()
+    image1 = rospy.wait_for_message(camera_image_topic, Image)
+    cv_image1 = bridge.imgmsg_to_cv2(image1, desired_encoding='bgr8')#used passthrough
+    info = rospy.wait_for_message(camera_info_topic, CameraInfo)
+    T_world_camera = lookup_transform(to_frame = camera_frame, from_frame="base", no_swap=True)
+    curr_pose = lookup_transform("right_gripper_tip", no_swap=True)[:3, -1]
+
+    moveit_plan(curr_pose, np.array([1, 0, 0, 0]))
+    image2 = rospy.wait_for_message(camera_image_topic, Image)
+    cv_image2 = bridge.imgmsg_to_cv2(image2, desired_encoding='bgr8')#used passthrough
+    #stereo = cv2.createStereoBM(numDisparities=16, blockSize=15)
+    window_size = 3
+    min_disp = 16
+    num_disp = 112-min_disp
+    stereo = cv2.StereoSGBM_create(minDisparity = min_disp,
+            numDisparities = num_disp,
+            blockSize = 16,
+            P1 = 8*3*window_size**2,
+            P2 = 32*3*window_size**2,
+            disp12MaxDiff = 1,
+            uniquenessRatio = 10,
+            speckleWindowSize = 100,
+            speckleRange = 32
+        )
+    
+    disp = stereo.compute(cv_image1, cv_image2)
+    h, w = cv_image1.shape[:2]
+    f = 0.8*w                          # guess for focal length
+    Q = info.K.reshape([3,3])
+    # WHY IS Q MATRIX 4x4 instead of 3x3????
+    # Q = np.float32([[1, 0, 0, -0.5*w],
+    #             [0,-1, 0,  0.5*h], # turn points 180 deg around x-axis,
+    #             [0, 0, 0,     -f], # so that y-axis looks up
+    #             [0, 0, 1,      0]])
+    points = cv2.reprojectImageTo3D(disp, Q)
+    print(points)
+    colors = cv2.cvtColor(cv_image1, cv2.COLOR_BGR2RGB)
+    mask = disp > disp.min()
+    out_points = points[mask]
+    out_colors = colors[mask]
+
+
+# Uses moveit to move to the specified point and orientation (in base frame)
+# Inputs:
+#   - point: [x, y, z] np array 
+#   - orientation: [x, y, z, w] np array as quarternion
+def moveit_plan(point, orientation):
+    planner = PathPlanner('{}_arm'.format("right"))
+    pose = Pose()
+    pose.position.x = point[0]
+    pose.position.y = point[1]
+    pose.position.z = point[2]
+    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = tuple(orientation)
+    planner.change_velocity(0.1)
+    plan = planner.plan_to_pose(pose)
+    planner.execute_plan(plan)
+
 def execute_grasp(T_world_grasp, planner, gripper):
     """
     Perform a pick and place procedure for the object. One strategy (which we have
@@ -468,77 +526,90 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == '__main__':
-    args = parse_args()
 
-    if args.debug:
-        np.random.seed(0)
+    rospy.init_node('dummy_tf_node')
+    camera_topic = '/usb_cam/image_raw'
+    camera_info = '/usb_cam/camera_info'
+    camera_frame = '/usb_cam'
+    planner = PathPlanner('{}_arm'.format("right"))
+    gripper = sawyer_gripper.Gripper("right")
+    mesh = do_multiview(camera_topic, camera_info, camera_frame, planner, gripper)
 
-    if not args.sim:
-        # Init rospy node (so we can use ROS commands)
-        rospy.init_node('dummy_tf_node')
 
-    if args.obj != 'cube':
-        # Mesh loading and pre-processing
-        mesh = trimesh.load_mesh("objects/{}.obj".format(args.obj))
-        # Transform object mesh to world frame
-        T_world_obj = lookup_transform(args.obj, no_swap=True)
-        print("DETECTED PAWN LOCATION", T_world_obj)
-        mesh.apply_transform(T_world_obj)
-        mesh.fix_normals()
-    else:
-        camera_frame = ''
-        if args.robot == 'baxter':
-            camera_topic = '/cameras/left_hand_camera/camera_info'
-            camera_info = '/cameras/left_hand_camera/camera_info'
-            camera_frame = '/left_hand_camera'
-        elif args.robot == 'sawyer':
-            camera_topic = '/usb_cam/image_raw'
-            camera_info = '/usb_cam/camera_info'
-            camera_frame = '/usb_cam'
-        else:
-            print("Unknown robot type!")
-            rospy.shutdown()
-        mesh = locate_cube(camera_topic, camera_info, camera_frame)
+    point = np.array([0.712, 0.168, -0.117])
+    orientation = np.array([0, 1, 0, 0])
+    moveit_plan(point, orientation)
+    # args = parse_args()
+
+    # if args.debug:
+    #     np.random.seed(0)
+
+    # if not args.sim:
+    #     # Init rospy node (so we can use ROS commands)
+    #     rospy.init_node('dummy_tf_node')
+
+    # if args.obj != 'cube':
+    #     # Mesh loading and pre-processing
+    #     mesh = trimesh.load_mesh("objects/{}.obj".format(args.obj))
+    #     # Transform object mesh to world frame
+    #     T_world_obj = lookup_transform(args.obj, no_swap=True)
+    #     print("DETECTED PAWN LOCATION", T_world_obj)
+    #     mesh.apply_transform(T_world_obj)
+    #     mesh.fix_normals()
+    # else:
+    #     camera_frame = ''
+    #     if args.robot == 'baxter':
+    #         camera_topic = '/cameras/left_hand_camera/camera_info'
+    #         camera_info = '/cameras/left_hand_camera/camera_info'
+    #         camera_frame = '/left_hand_camera'
+    #     elif args.robot == 'sawyer':
+    #         camera_topic = '/usb_cam/image_raw'
+    #         camera_info = '/usb_cam/camera_info'
+    #         camera_frame = '/usb_cam'
+    #     else:
+    #         print("Unknown robot type!")
+    #         rospy.shutdown()
+    #     mesh = locate_cube(camera_topic, camera_info, camera_frame)
         
-        mesh.fix_normals()
-        # pawn_mesh = trimesh.load_mesh("objects/{}.obj".format("pawn"))
-        # # Transform object mesh to world frame
-        # T_world_obj = lookup_transform("usb_cam")
-        # T_world_obj[2, 3] + 0.2 
-        # #print("DETECTED PAWN LOCATION", T_world_obj)
-        # pawn_mesh.apply_transform(T_world_obj)
-        # pawn_mesh.fix_normals()
-        # vedo.show([mesh, pawn_mesh], new=True)
+    #     mesh.fix_normals()
+    #     # pawn_mesh = trimesh.load_mesh("objects/{}.obj".format("pawn"))
+    #     # # Transform object mesh to world frame
+    #     # T_world_obj = lookup_transform("usb_cam")
+    #     # T_world_obj[2, 3] + 0.2 
+    #     # #print("DETECTED PAWN LOCATION", T_world_obj)
+    #     # pawn_mesh.apply_transform(T_world_obj)
+    #     # pawn_mesh.fix_normals()
+    #     # vedo.show([mesh, pawn_mesh], new=True)
 
-    # This policy takes a mesh and returns the best actions to execute on the robot
-    grasping_policy = GraspingPolicy(
-        args.n_vert, 
-        args.n_grasps, 
-        args.n_execute, 
-        args.n_facets, 
-        args.metric
-    )
+    # # This policy takes a mesh and returns the best actions to execute on the robot
+    # grasping_policy = GraspingPolicy(
+    #     args.n_vert, 
+    #     args.n_grasps, 
+    #     args.n_execute, 
+    #     args.n_facets, 
+    #     args.metric
+    # )
 
-    # Each grasp is represented by T_grasp_world, a RigidTransform defining the 
-    # position of the end effector
-    grasp_vertices_total, grasp_poses = grasping_policy.top_n_actions(mesh, args.obj)
+    # # Each grasp is represented by T_grasp_world, a RigidTransform defining the 
+    # # position of the end effector
+    # grasp_vertices_total, grasp_poses = grasping_policy.top_n_actions(mesh, args.obj)
 
-    if not args.sim:
-        # Execute each grasp on the baxter / sawyer
-        if args.robot == "baxter":
-            gripper = baxter_gripper.Gripper(args.arm)
-            planner = PathPlanner('{}_arm'.format(args.arm))
-        elif args.robot == "sawyer":
-            gripper = sawyer_gripper.Gripper("right")
-            planner = PathPlanner('{}_arm'.format("right"))
-        else:
-            print("Unknown robot type!")
-            rospy.shutdown()
+    # if not args.sim:
+    #     # Execute each grasp on the baxter / sawyer
+    #     if args.robot == "baxter":
+    #         gripper = baxter_gripper.Gripper(args.arm)
+    #         planner = PathPlanner('{}_arm'.format(args.arm))
+    #     elif args.robot == "sawyer":
+    #         gripper = sawyer_gripper.Gripper("right")
+    #         planner = PathPlanner('{}_arm'.format("right"))
+    #     else:
+    #         print("Unknown robot type!")
+    #         rospy.shutdown()
 
-    for grasp_vertices, grasp_pose in zip(grasp_vertices_total, grasp_poses):
-        grasping_policy.visualize_grasp(mesh, grasp_vertices, grasp_pose)
-        if not args.sim:
-            repeat = True
-            while repeat:
-                execute_grasp(grasp_pose, planner, gripper)
-                repeat = raw_input("repeat? [y|n] ") == 'y'
+    # for grasp_vertices, grasp_pose in zip(grasp_vertices_total, grasp_poses):
+    #     grasping_policy.visualize_grasp(mesh, grasp_vertices, grasp_pose)
+    #     if not args.sim:
+    #         repeat = True
+    #         while repeat:
+    #             execute_grasp(grasp_pose, planner, gripper)
+    #             repeat = raw_input("repeat? [y|n] ") == 'y'

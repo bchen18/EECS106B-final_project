@@ -21,6 +21,6 @@ void loop(){
 //    Serial.println(Vout);
 //    Serial.print("R2: ");
     Serial.println(R2);
-    delay(1000);
+    delay(100);
   }
 }
