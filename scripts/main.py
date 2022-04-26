@@ -9,6 +9,7 @@ import argparse
 from scipy.spatial.transform import Rotation
 from utils import rotation_from_quaternion, create_transform_matrix, quaternion_from_matrix
 import trimesh
+from mpl_toolkits import mplot3d
 import matplotlib.pyplot as plt
 from policies import GraspingPolicy
 import vedo
@@ -72,43 +73,69 @@ def lookup_transform(to_frame, from_frame='base', no_swap = False):
     return create_transform_matrix(rot, tag_pos)
 
 
+def rot_z(theta):
+    return np.array([[np.cos(theta), 0, np.sin(theta)],
+                     [np.sin(theta), np.cos(theta), 0], 
+                     [0, 0, 1]])
+
 def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, gripper):
+    curr_pose = lookup_transform("right_gripper_tip", no_swap=True)[:3, -1]
+    #moveit_plan(curr_pose, np.array([0, 1, 0, 0]), speed=1.0)
     bridge = CvBridge()
     image1 = rospy.wait_for_message(camera_image_topic, Image)
+    #cv_image1 = cv2.imread('ambush_5_left.jpg')
+    #cv_image2 = cv2.imread('ambush_5_right.jpg')
     cv_image1 = bridge.imgmsg_to_cv2(image1, desired_encoding='bgr8')#used passthrough
-    info = rospy.wait_for_message(camera_info_topic, CameraInfo)
-    T_world_camera = lookup_transform(to_frame = camera_frame, from_frame="base", no_swap=True)
-    curr_pose = lookup_transform("right_gripper_tip", no_swap=True)[:3, -1]
 
-    moveit_plan(curr_pose, np.array([1, 0, 0, 0]))
+
+    info = rospy.wait_for_message(camera_info_topic, CameraInfo)
+    T_world_camera_before = lookup_transform(to_frame = camera_frame, from_frame="base", no_swap=True)
+    cv2.imwrite("im1.png", cv_image1)
+
+    #moveit_plan(curr_pose, np.array([1, 0, 0, 0]), speed=1.0)
+    moveit_plan(curr_pose+np.array([0, -0.05, 0]), np.array([0, 1, 0, 0]), speed=1.0)
+    T_world_camera_after = lookup_transform(to_frame = camera_frame, from_frame="base", no_swap=True)
     image2 = rospy.wait_for_message(camera_image_topic, Image)
     cv_image2 = bridge.imgmsg_to_cv2(image2, desired_encoding='bgr8')#used passthrough
+    cv2.imwrite("im2.png", cv_image2)
     #stereo = cv2.createStereoBM(numDisparities=16, blockSize=15)
     window_size = 3
     min_disp = 16
     num_disp = 112-min_disp
-    stereo = cv2.StereoSGBM_create(minDisparity = min_disp,
-            numDisparities = num_disp,
-            blockSize = 16,
-            P1 = 8*3*window_size**2,
-            P2 = 32*3*window_size**2,
-            disp12MaxDiff = 1,
-            uniquenessRatio = 10,
-            speckleWindowSize = 100,
-            speckleRange = 32
+    stereo = cv2.StereoSGBM_create(
+            numDisparities=112,
+            #minDisparity = min_disp,
+            #numDisparities = num_disp,
+            #blockSize = 16,
+            #P1 = 8*3*window_size**2,
+            #P2 = 32*3*window_size**2,
+            # disp12MaxDiff = 0,
+            # uniquenessRatio = 10,
+            # speckleWindowSize = 50,
+            # speckleRange = 1
         )
-    
     disp = stereo.compute(cv_image1, cv_image2)
+    cv2.imwrite("disp.png", disp)
+    #return
     h, w = cv_image1.shape[:2]
     f = 0.8*w                          # guess for focal length
-    Q = info.K.reshape([3,3])
+    K = np.array(info.K).reshape([3,3])
+    dist = info.D
+    R = rot_z(np.pi)
+    T = T_world_camera_after[:3, 3] - T_world_camera_before[:3, 3]
+    _, _, _, _, Q, _, _ = cv2.stereoRectify(K, dist, K, dist, (w, h), R, T)# reverse the order of h and w??
     # WHY IS Q MATRIX 4x4 instead of 3x3????
     # Q = np.float32([[1, 0, 0, -0.5*w],
     #             [0,-1, 0,  0.5*h], # turn points 180 deg around x-axis,
     #             [0, 0, 0,     -f], # so that y-axis looks up
     #             [0, 0, 1,      0]])
     points = cv2.reprojectImageTo3D(disp, Q)
-    print(points)
+    pts = np.array(points).reshape([-1, 3])
+    fig = plt.figure()
+    ax = plt.axes(projection="3d")
+    ax.scatter(pts[::10, 0], pts[::10, 1], pts[::10, 2])
+    plt.show()
+    print(points.shape)
     colors = cv2.cvtColor(cv_image1, cv2.COLOR_BGR2RGB)
     mask = disp > disp.min()
     out_points = points[mask]
@@ -119,14 +146,14 @@ def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, g
 # Inputs:
 #   - point: [x, y, z] np array 
 #   - orientation: [x, y, z, w] np array as quarternion
-def moveit_plan(point, orientation):
+def moveit_plan(point, orientation, speed=0.1):
     planner = PathPlanner('{}_arm'.format("right"))
     pose = Pose()
     pose.position.x = point[0]
     pose.position.y = point[1]
     pose.position.z = point[2]
     pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = tuple(orientation)
-    planner.change_velocity(0.1)
+    planner.change_velocity(speed)
     plan = planner.plan_to_pose(pose)
     planner.execute_plan(plan)
 
@@ -538,7 +565,7 @@ if __name__ == '__main__':
 
     point = np.array([0.712, 0.168, -0.117])
     orientation = np.array([0, 1, 0, 0])
-    moveit_plan(point, orientation)
+    #moveit_plan(point, orientation)
     # args = parse_args()
 
     # if args.debug:
