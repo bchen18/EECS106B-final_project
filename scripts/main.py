@@ -80,43 +80,60 @@ def rot_z(theta):
 
 def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, gripper):
     curr_pose = lookup_transform("right_gripper_tip", no_swap=True)[:3, -1]
-    #moveit_plan(curr_pose, np.array([0, 1, 0, 0]), speed=1.0)
     bridge = CvBridge()
+
+    # Get first image
+    moveit_plan(curr_pose, np.array([0, 1, 0, 0]), speed=0.5)
+    rospy.sleep(0.5)
     image1 = rospy.wait_for_message(camera_image_topic, Image)
-    #cv_image1 = cv2.imread('ambush_5_left.jpg')
-    #cv_image2 = cv2.imread('ambush_5_right.jpg')
     cv_image1 = bridge.imgmsg_to_cv2(image1, desired_encoding='bgr8')#used passthrough
-
-
     info = rospy.wait_for_message(camera_info_topic, CameraInfo)
     T_world_camera_before = lookup_transform(to_frame = camera_frame, from_frame="base", no_swap=True)
     cv2.imwrite("im1.png", cv_image1)
+    #cv_image1 = np.uint8(cv_image1) #need to cast to uint8 for StereoBM_create?
+    #cv_image1 = cv2.cvtColor(cv_image1, cv2.COLOR_BGR2GRAY)
 
+    # Move a bit, then get second image
     #moveit_plan(curr_pose, np.array([1, 0, 0, 0]), speed=1.0)
-    moveit_plan(curr_pose+np.array([0, -0.05, 0]), np.array([0, 1, 0, 0]), speed=1.0)
+    moveit_plan(curr_pose+np.array([-0.02, 0, 0]), np.array([0, 1, 0, 0]), speed=0.5)
+    rospy.sleep(0.5)
     T_world_camera_after = lookup_transform(to_frame = camera_frame, from_frame="base", no_swap=True)
     image2 = rospy.wait_for_message(camera_image_topic, Image)
     cv_image2 = bridge.imgmsg_to_cv2(image2, desired_encoding='bgr8')#used passthrough
     cv2.imwrite("im2.png", cv_image2)
-    #stereo = cv2.createStereoBM(numDisparities=16, blockSize=15)
+    #cv_image2 = np.uint8(cv_image2) #need to cast to uint8 for StereoBM_create?
+    #cv_image2 = cv2.cvtColor(cv_image2, cv2.COLOR_BGR2GRAY)
+
+    # Test images
+    # cv_image1 = cv2.imread('ambush_5_left.jpg')
+    # cv_image2 = cv2.imread('ambush_5_right.jpg')
+
+    # Construct disparity map
+    #stereo = cv2.StereoBM_create(numDisparities=16, blockSize=15)
     window_size = 3
     min_disp = 16
     num_disp = 112-min_disp
     stereo = cv2.StereoSGBM_create(
-            numDisparities=112,
+            numDisparities=160,#112,
             #minDisparity = min_disp,
             #numDisparities = num_disp,
-            #blockSize = 16,
+            blockSize = 15,#15,
             #P1 = 8*3*window_size**2,
             #P2 = 32*3*window_size**2,
             # disp12MaxDiff = 0,
             # uniquenessRatio = 10,
-            # speckleWindowSize = 50,
+            #speckleWindowSize = 10,
             # speckleRange = 1
         )
     disp = stereo.compute(cv_image1, cv_image2)
+    print("disparity:", disp)
+
+    # Try some post-processing on disparity map
+    #disp = cv2.fastNlMeansDenoising(disp, None)
     cv2.imwrite("disp.png", disp)
     #return
+
+    # Grab Q matrix
     h, w = cv_image1.shape[:2]
     f = 0.8*w                          # guess for focal length
     K = np.array(info.K).reshape([3,3])
@@ -129,13 +146,14 @@ def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, g
     #             [0,-1, 0,  0.5*h], # turn points 180 deg around x-axis,
     #             [0, 0, 0,     -f], # so that y-axis looks up
     #             [0, 0, 1,      0]])
+
+    # Reproject image points to 3D using disparity map and Q matrix
     points = cv2.reprojectImageTo3D(disp, Q)
     pts = np.array(points).reshape([-1, 3])
     fig = plt.figure()
     ax = plt.axes(projection="3d")
-    ax.scatter(pts[::10, 0], pts[::10, 1], pts[::10, 2])
+    ax.scatter(pts[::15, 0], pts[::15, 1], pts[::15, 2])
     plt.show()
-    print(points.shape)
     colors = cv2.cvtColor(cv_image1, cv2.COLOR_BGR2RGB)
     mask = disp > disp.min()
     out_points = points[mask]
