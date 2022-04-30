@@ -15,10 +15,12 @@ from policies import GraspingPolicy
 import vedo
 try:
     import rospy
+    #import ros_numpy
     import tf
     from cv_bridge import CvBridge
     from geometry_msgs.msg import Pose, PoseStamped
-    from sensor_msgs.msg import Image, CameraInfo
+    import sensor_msgs.point_cloud2
+    from sensor_msgs.msg import Image, CameraInfo, PointCloud2
     from baxter_interface import gripper as baxter_gripper
     from intera_interface import gripper as sawyer_gripper
     from path_planner import PathPlanner
@@ -78,6 +80,7 @@ def rot_z(theta):
                      [np.sin(theta), np.cos(theta), 0], 
                      [0, 0, 1]])
 
+# Use multiview reconstruction to get point cloud and initial mesh guess. This doesn't work!
 def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, gripper):
     curr_pose = lookup_transform("right_gripper_tip", no_swap=True)[:3, -1]
     bridge = CvBridge()
@@ -139,7 +142,8 @@ def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, g
     f = 0.8*w                          # guess for focal length
     K = np.array(info.K).reshape([3,3])
     dist = info.D
-    R = rot_z(np.pi)
+    #R = rot_z(np.pi)
+    R = rot_z(0)
     T = T_world_camera_after[:3, 3] - T_world_camera_before[:3, 3]
     _, _, _, _, Q, _, _ = cv2.stereoRectify(K, dist, K, dist, (w, h), R, T)# reverse the order of h and w??
     # WHY IS Q MATRIX 4x4 instead of 3x3????
@@ -165,6 +169,44 @@ def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, g
     out_points = points[mask]
     out_colors = colors[mask]
 
+# Use RealSense IR camera to get pointcloud and initial mesh guess
+def realsense_pointcloud(realsense_topic, camera_frame):
+    print("getting realsense pointcloud")
+    # Get pointcloud from realsense camera. Points are in camera frame!
+    pointcloud = rospy.wait_for_message(realsense_topic, PointCloud2)
+    points_3d = np.array([])
+    for point in sensor_msgs.point_cloud2.read_points(pointcloud, skip_nans=True):
+            if points_3d.size == 0:
+                points_3d = np.array(point[:3]).reshape((1, 3))
+            else:
+                curr_point = np.array(point[:3]).reshape((1, 3))
+                points_3d = np.vstack((points_3d, curr_point))
+
+    print(points_3d.shape) #should be N x 3
+
+    # Filter pointcloud to remove noise and table points
+    points_3d = points_3d[points_3d[:, 2]<0.75] # anything greater than 0.75 meter away from camera is noise
+    points_3d = points_3d[points_3d[:, 2]>0.2] # anything less than 0.2 meter from camera is also noise
+    # Get "lowest" point which corresponds to table z coordinate, then remove points slightly above that to remove the table
+    # this is trucky, may need a different way to remove the table
+    lowest_point = max(points_3d[:, 2])
+    print(lowest_point)
+    points_3d = points_3d[points_3d[:, 2]<lowest_point-0.05] # anything greater than table height away from camera is probably the table
+
+    # Show pointcloud
+    fig = plt.figure()
+    ax = plt.axes(projection="3d")
+    ax.scatter(points_3d [::10, 0], points_3d[::10, 1], points_3d[::10, 2])
+    plt.show()
+
+    # Transform points in pointcloud to base frame
+    # camera_pose = lookup_transform(camera_frame, no_swap=True)
+    # points_3d = np.matmul(points_3d, camera_pose[:3, :3])
+    # points_3d += camera_pose[:3, -1] # may need to do this in loop idk how to broadcast
+
+    # Create trimesh object (we know object shape beforehand)
+
+    return 0
 
 # Uses moveit to move to the specified point and orientation (in base frame)
 # Inputs:
@@ -579,13 +621,22 @@ def parse_args():
 if __name__ == '__main__':
 
     rospy.init_node('dummy_tf_node')
+
+    # for USB cam
     camera_topic = '/usb_cam/image_raw'
     camera_info = '/usb_cam/camera_info'
     camera_frame = '/usb_cam'
+
+    # for RealSense cam
+    realsense_pointcloud_topic = 'camera/depth/color/points'
+    realsense_camera_frame = 'camera_depth_optical_frame'
+
     planner = PathPlanner('{}_arm'.format("right"))
     gripper = sawyer_gripper.Gripper("right")
-    mesh = do_multiview(camera_topic, camera_info, camera_frame, planner, gripper)
 
+    # Get initial mesh guess
+    #mesh = do_multiview(camera_topic, camera_info, camera_frame, planner, gripper)
+    mesh = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame)
 
     point = np.array([0.712, 0.168, -0.117])
     orientation = np.array([0, 1, 0, 0])
