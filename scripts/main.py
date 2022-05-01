@@ -3,6 +3,7 @@
 Starter Script for C106B Grasp Planning Lab
 Authors: Chris Correa, Riddhi Bagadiaa, Jay Monga
 """
+from cv2 import transform
 import numpy as np
 import cv2
 import argparse
@@ -11,11 +12,12 @@ from utils import rotation_from_quaternion, create_transform_matrix, quaternion_
 import trimesh
 from mpl_toolkits import mplot3d
 import matplotlib.pyplot as plt
+from scipy.spatial import ConvexHull
+from sklearn.cluster import KMeans
 from policies import GraspingPolicy
 import vedo
 try:
     import rospy
-    #import ros_numpy
     import tf
     from cv_bridge import CvBridge
     from geometry_msgs.msg import Pose, PoseStamped
@@ -62,7 +64,6 @@ def lookup_transform(to_frame, from_frame='base', no_swap = False):
             rate.sleep()
             attempts += 1
     print("exiting")
-    print(tag_rot)
     if no_swap:
         r = Rotation.from_quat(tag_rot)
         try:
@@ -71,7 +72,6 @@ def lookup_transform(to_frame, from_frame='base', no_swap = False):
             rot = r.as_matrix()
     else:
         rot = rotation_from_quaternion(tag_rot)
-    print(rot)
     return create_transform_matrix(rot, tag_pos)
 
 
@@ -170,7 +170,7 @@ def do_multiview(camera_image_topic, camera_info_topic, camera_frame, planner, g
     out_colors = colors[mask]
 
 # Use RealSense IR camera to get pointcloud and initial mesh guess
-def realsense_pointcloud(realsense_topic, camera_frame):
+def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_shape='cube'):
     print("getting realsense pointcloud")
     # Get pointcloud from realsense camera. Points are in camera frame!
     pointcloud = rospy.wait_for_message(realsense_topic, PointCloud2)
@@ -189,24 +189,63 @@ def realsense_pointcloud(realsense_topic, camera_frame):
     points_3d = points_3d[points_3d[:, 2]>0.2] # anything less than 0.2 meter from camera is also noise
     # Get "lowest" point which corresponds to table z coordinate, then remove points slightly above that to remove the table
     # this is trucky, may need a different way to remove the table
-    lowest_point = max(points_3d[:, 2])
-    print(lowest_point)
-    points_3d = points_3d[points_3d[:, 2]<lowest_point-0.05] # anything greater than table height away from camera is probably the table
+    lowest_point = np.argmax(points_3d[:, 2])
+    highest_point = np.argmin(points_3d[:, 2])
+    lowest_z = points_3d[lowest_point, 2]
+    print(lowest_z)
+    # fig = plt.figure()
+    # ax = plt.axes(projection="3d")
+    # ax.scatter(points_3d [::10, 0], points_3d[::10, 1], points_3d[::10, 2])
+    # plt.show()
+    if use_kmeans:
+        # Try filtering out table with k means
+        table_detector = KMeans(4)
+        point_labels = table_detector.fit_predict(points_3d[:, 2].reshape([-1, 1]))
+        highest_label = point_labels[highest_point]
+        points_3d = points_3d[point_labels == highest_label]
+    else:
+        
+        points_3d = points_3d[points_3d[:, 2]<lowest_z-0.05] # anything greater than table height away from camera is probably the table
 
     # Show pointcloud
     fig = plt.figure()
     ax = plt.axes(projection="3d")
     ax.scatter(points_3d [::10, 0], points_3d[::10, 1], points_3d[::10, 2])
     plt.show()
+    
+    
 
     # Transform points in pointcloud to base frame
-    # camera_pose = lookup_transform(camera_frame, no_swap=True)
+    camera_pose = lookup_transform(camera_frame, no_swap=True)
+    homog = np.ones([points_3d.shape[0], 1])
+    points_3d = np.matmul(camera_pose, np.concatenate([points_3d, homog], axis=-1).T ).T
+
+
     # points_3d = np.matmul(points_3d, camera_pose[:3, :3])
     # points_3d += camera_pose[:3, -1] # may need to do this in loop idk how to broadcast
 
-    # Create trimesh object (we know object shape beforehand)
+    centroid = np.mean(points_3d, axis=0)
+    print(centroid)
+    R = np.eye(3) # dummy initial rotation
 
-    return 0
+    object=0
+
+    pose = np.zeros([4, 4])
+    pose[:3, :3] = R
+    pose[3, 3] = 1
+    pose[:3, -1] = centroid[:3]
+
+    # Create trimesh object (we know object shape beforehand)
+    if obj_shape == "cube":
+        #return early for now  
+        side_length = 4.9
+        
+        object = trimesh.primitives.Box(extents=(side_length, side_length, side_length), transform=pose)
+    elif obj_shape == "realsense":
+        object = trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
+    elif obj_shape == "glass":
+        object = trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)
+    return object
 
 # Uses moveit to move to the specified point and orientation (in base frame)
 # Inputs:
@@ -581,46 +620,47 @@ def parse_args():
     Parses arguments from the user. Read comments for more details.
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument('-obj', type=str, default='pawn', help=
-        """Which Object you\'re trying to pick up.  Options: nozzle, pawn, cube.  
-        Default: pawn"""
+    parser.add_argument('-obj', type=str, default='cube', help=
+        """Which Object you\'re trying to localize.  Options: cube, realsense, glass.  
+        Default: cube"""
     )
-    parser.add_argument('-n_vert', type=int, default=1000, help=
-        'How many vertices you want to sample on the object surface.  Default: 1000'
-    )
-    parser.add_argument('-n_facets', type=int, default=32, help=
-        """You will approximate the friction cone as a set of n_facets vectors along 
-        the surface.  This way, to check if a vector is within the friction cone, all 
-        you have to do is check if that vector can be represented by a POSITIVE 
-        linear combination of the n_facets vectors.  Default: 32"""
-    )
-    parser.add_argument('-n_grasps', type=int, default=500, help=
-        'How many grasps you want to sample.  Default: 500')
-    parser.add_argument('-n_execute', type=int, default=5, help=
-        'How many grasps you want to execute.  Default: 5')
-    parser.add_argument('-metric', '-m', type=str, default='compute_force_closure', help=
-        """Which grasp metric in grasp_metrics.py to use.  
-        Options: compute_force_closure, compute_gravity_resistance, compute_robust_force_closure, compute_ferrari_canny"""
-    )
-    parser.add_argument('-arm', '-a', type=str, default='right', help=
-        'Options: left, right.  Default: right'
-    )
-    parser.add_argument('-robot', type=str, default='baxter', help=
-        """Which robot you're using.  Options: baxter, sawyer.  
-        Default: baxter"""
-    )
-    parser.add_argument('--sim', action='store_true', help=
-        """If you don\'t use this flag, you will only visualize the grasps.  This is 
-        so you can run this outside of hte lab"""
-    )
-    parser.add_argument('--debug', action='store_true', help=
-        'Whether or not to use a random seed'
-    )
+    # parser.add_argument('-n_vert', type=int, default=1000, help=
+    #     'How many vertices you want to sample on the object surface.  Default: 1000'
+    # )
+    # parser.add_argument('-n_facets', type=int, default=32, help=
+    #     """You will approximate the friction cone as a set of n_facets vectors along 
+    #     the surface.  This way, to check if a vector is within the friction cone, all 
+    #     you have to do is check if that vector can be represented by a POSITIVE 
+    #     linear combination of the n_facets vectors.  Default: 32"""
+    # )
+    # parser.add_argument('-n_grasps', type=int, default=500, help=
+    #     'How many grasps you want to sample.  Default: 500')
+    # parser.add_argument('-n_execute', type=int, default=5, help=
+    #     'How many grasps you want to execute.  Default: 5')
+    # parser.add_argument('-metric', '-m', type=str, default='compute_force_closure', help=
+    #     """Which grasp metric in grasp_metrics.py to use.  
+    #     Options: compute_force_closure, compute_gravity_resistance, compute_robust_force_closure, compute_ferrari_canny"""
+    # )
+    # parser.add_argument('-arm', '-a', type=str, default='right', help=
+    #     'Options: left, right.  Default: right'
+    # )
+    # parser.add_argument('-robot', type=str, default='baxter', help=
+    #     """Which robot you're using.  Options: baxter, sawyer.  
+    #     Default: baxter"""
+    # )
+    # parser.add_argument('--sim', action='store_true', help=
+    #     """If you don\'t use this flag, you will only visualize the grasps.  This is 
+    #     so you can run this outside of hte lab"""
+    # )
+    # parser.add_argument('--debug', action='store_true', help=
+    #     'Whether or not to use a random seed'
+    # )
     return parser.parse_args()
 
 if __name__ == '__main__':
 
     rospy.init_node('dummy_tf_node')
+    args = parse_args()
 
     # for USB cam
     camera_topic = '/usb_cam/image_raw'
@@ -636,10 +676,15 @@ if __name__ == '__main__':
 
     # Get initial mesh guess
     #mesh = do_multiview(camera_topic, camera_info, camera_frame, planner, gripper)
-    mesh = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame)
+    mesh = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame, obj_shape=args.obj)
 
-    point = np.array([0.712, 0.168, -0.117])
-    orientation = np.array([0, 1, 0, 0])
+    # Show mesh in vedo
+    vedo.show([mesh], new=True)
+
+    # Show mesh in rviz
+
+    #point = np.array([0.712, 0.168, -0.117])
+    #orientation = np.array([0, 1, 0, 0])
     #moveit_plan(point, orientation)
     # args = parse_args()
 
