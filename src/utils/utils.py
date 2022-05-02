@@ -258,3 +258,9 @@ def quaternion_from_matrix(matrix):
     except:
         r = Rotation.from_matrix(matrix)
     return r.as_quat()
+
+def rot_z(theta):
+    return np.array([[np.cos(theta), 0, np.sin(theta)],
+                     [np.sin(theta), np.cos(theta), 0], 
+                     [0, 0, 1]])
+

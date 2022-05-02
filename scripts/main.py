@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 from scipy.spatial import ConvexHull
 from sklearn.cluster import KMeans
 from policies import GraspingPolicy
+import time
+from copy import deepcopy
 import vedo
 try:
     import rospy
@@ -23,6 +25,7 @@ try:
     from geometry_msgs.msg import Pose, PoseStamped
     import sensor_msgs.point_cloud2
     from sensor_msgs.msg import Image, CameraInfo, PointCloud2
+    from std_msgs.msg import Float32
     from baxter_interface import gripper as baxter_gripper
     from intera_interface import gripper as sawyer_gripper
     from path_planner import PathPlanner
@@ -30,6 +33,45 @@ try:
 except:
     print('Couldn\'t import ROS.  I assume you\'re running this on your laptop')
     ros_enabled = False
+
+class ParticleFilter:
+    def __init__(self, num_particles, initial_guess, sample_std, mesh_fn = lambda pose: trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)):
+        self.num_particles = num_particles
+        self.initial_guess = initial_guess
+        self.mesh_fn = mesh_fn
+        self.sample_std = sample_std
+        # create initial particle
+        self.particles = [mesh_fn(self.initial_guess)]
+        self.weights = [1]
+        # sample initial set of particles from initial guess
+        self.particles = self.create_particles()
+    
+    def create_particles(self):
+        particles = []
+        for _ in range(self.num_particles):
+            base_particle = np.random.choice(self.particles, p = self.weights)
+            sampled_particle = self.sample_particle(base_particle)
+            particles.append(sampled_particle)
+        return particles
+
+    def sample_particle(self, base_particle):
+        # generate a uniformly random rotation
+        rand_rot_perturb, _ = np.linalg.qr(np.random.randn(3, 3), mode='complete')
+        rand_pos_perturb = np.random.normal(scale=self.sample_std, size=[3])
+        curr_transform = deepcopy(base_particle.primitive.transform)
+        curr_transform[:3, :3] = np.matmul(curr_transform[:3, :3], rand_rot_perturb)
+        curr_transform[:3, -1] += rand_pos_perturb
+        new_particle = self.mesh_fn(curr_transform)
+        return new_particle
+
+    def reweight_particle(self, particle_idx, mult_factor):
+        self.weights[particle_idx] *= mult_factor
+        total_weight = sum(self.weights)
+        #renormalize weights
+        self.weights = [p / total_weight for p in self.weights]
+            
+
+
 
 def lookup_transform(to_frame, from_frame='base', no_swap = False):
     """
@@ -239,19 +281,21 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
     if obj_shape == "cube":
         #return early for now  
         side_length = 4.9
-        
         object = trimesh.primitives.Box(extents=(side_length, side_length, side_length), transform=pose)
     elif obj_shape == "realsense":
         object = trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
+        mesh_fn = lambda pose: trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
     elif obj_shape == "glass":
         object = trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)
-    return object
+
+    particle_filter = ParticleFilter(10, pose, 0.1, mesh_fn=mesh_fn)
+    return particle_filter
 
 # Uses moveit to move to the specified point and orientation (in base frame)
 # Inputs:
 #   - point: [x, y, z] np array 
 #   - orientation: [x, y, z, w] np array as quarternion
-def moveit_plan(point, orientation, speed=0.1):
+def moveit_plan(point, orientation, speed=0.1, force_feedback=False):
     planner = PathPlanner('{}_arm'.format("right"))
     pose = Pose()
     pose.position.x = point[0]
@@ -260,7 +304,11 @@ def moveit_plan(point, orientation, speed=0.1):
     pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = tuple(orientation)
     planner.change_velocity(speed)
     plan = planner.plan_to_pose(pose)
-    planner.execute_plan(plan)
+    planner.execute_plan(plan, wait=not force_feedback)
+    if force_feedback:
+        rospy.wait_for_message('force_resistance', Float32)
+        planner._group.stop()
+    
 
 def execute_grasp(T_world_grasp, planner, gripper):
     """
@@ -674,18 +722,18 @@ if __name__ == '__main__':
     planner = PathPlanner('{}_arm'.format("right"))
     gripper = sawyer_gripper.Gripper("right")
 
-    # Get initial mesh guess
+    # Get initial mesh guess and generate particle filter
     #mesh = do_multiview(camera_topic, camera_info, camera_frame, planner, gripper)
-    mesh = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame, obj_shape=args.obj)
+    #particle_filter = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame, obj_shape=args.obj)
 
     # Show mesh in vedo
-    vedo.show([mesh], new=True)
+    #vedo.show([mesh], new=True)
 
     # Show mesh in rviz
 
-    #point = np.array([0.712, 0.168, -0.117])
-    #orientation = np.array([0, 1, 0, 0])
-    #moveit_plan(point, orientation)
+    point = np.array([0.712, 0.168, -0.117])
+    orientation = np.array([0, 1, 0, 0])
+    moveit_plan(point, orientation, force_feedback=True)
     # args = parse_args()
 
     # if args.debug:

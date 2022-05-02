@@ -113,7 +113,7 @@ class PathPlanner(object):
         self._group.set_joint_value_target(target_joints)
         return self._group.plan()
 
-    def execute_plan(self, plan):
+    def execute_plan(self, plan, wait=True):
         """
         Uses the robot's built-in controllers to execute a plan
 
@@ -121,7 +121,7 @@ class PathPlanner(object):
         plan: a moveit_msgs/RobotTrajectory plan
         """
 
-        return self._group.execute(plan, wait=True)
+        return self._group.execute(plan, wait=wait)
 
     def change_velocity(self, x):
         self._group.set_max_velocity_scaling_factor(x)
