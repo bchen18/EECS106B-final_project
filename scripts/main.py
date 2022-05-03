@@ -3,11 +3,13 @@
 Starter Script for C106B Grasp Planning Lab
 Authors: Chris Correa, Riddhi Bagadiaa, Jay Monga
 """
+from readline import get_completion_type
 from cv2 import transform
 import numpy as np
 import cv2
 import argparse
 from scipy.spatial.transform import Rotation
+from rospy import Publisher, ROSException
 from utils import rotation_from_quaternion, create_transform_matrix, quaternion_from_matrix
 import trimesh
 from mpl_toolkits import mplot3d
@@ -16,6 +18,8 @@ from scipy.spatial import ConvexHull
 from sklearn.cluster import KMeans
 from policies import GraspingPolicy
 import time
+from visualization_msgs.msg import Marker, MarkerArray
+
 from copy import deepcopy
 import vedo
 try:
@@ -35,7 +39,7 @@ except:
     ros_enabled = False
 
 class ParticleFilter:
-    def __init__(self, num_particles, initial_guess, sample_std, mesh_fn = lambda pose: trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)):
+    def __init__(self, num_particles, initial_guess, sample_std, mesh_fn = lambda pose: trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose), min_z=0):
         self.num_particles = num_particles
         self.initial_guess = initial_guess
         self.mesh_fn = mesh_fn
@@ -43,8 +47,12 @@ class ParticleFilter:
         # create initial particle
         self.particles = [mesh_fn(self.initial_guess)]
         self.weights = [1]
+        self.min_z=min_z
         # sample initial set of particles from initial guess
         self.particles = self.create_particles()
+        self.weights = [1/self.num_particles for _ in range(self.num_particles)]
+        self.markerArray = []
+        
     
     def create_particles(self):
         particles = []
@@ -61,15 +69,63 @@ class ParticleFilter:
         curr_transform = deepcopy(base_particle.primitive.transform)
         curr_transform[:3, :3] = np.matmul(curr_transform[:3, :3], rand_rot_perturb)
         curr_transform[:3, -1] += rand_pos_perturb
+        curr_transform[3, -1] = max(self.min_z, curr_transform[3, -1])
         new_particle = self.mesh_fn(curr_transform)
         return new_particle
 
     def reweight_particle(self, particle_idx, mult_factor):
         self.weights[particle_idx] *= mult_factor
+    
+    def renormalize_weights(self):
         total_weight = sum(self.weights)
         #renormalize weights
         self.weights = [p / total_weight for p in self.weights]
-            
+
+    def sorted_particles(self):
+        idxs = np.argsort(self.weights)
+        sorted_particles = np.array(self.particles)[idxs][::-1]
+        return sorted_particles
+
+    def reweight_particles(self, touch_pose, got_touched):
+        touch_position = touch_pose[:3, -1]
+        touch_rot = touch_pose[:3, :3]
+        for i, particle in enumerate(self.particles):
+            point, dist, _ = trimesh.proximity.closest_point(particle, [touch_position])
+            if got_touched:
+                factor = np.log(1/dist)
+            else:
+                factor = np.log(dist)
+            print("PARTICLE SIZE: ", len(self.particles), len(self.weights))
+            self.reweight_particle(i, factor)
+        self.renormalize_weights()
+
+    def makeMarkers(self):
+        for i, particle in enumerate(self.particles):
+            position = particle.primitive.transform[:3, -1]
+            orientation = quaternion_from_matrix(particle.primitive.transform[:3, :3])
+            marker = Marker()
+            marker.header.frame_id = "base"
+            marker.type = 1
+            marker.id = i
+            marker.action = 0
+            marker.pose.position.x = position[0]
+            marker.pose.position.y = position[1]
+            marker.pose.position.z = position[2]
+            marker.pose.orientation.x = orientation[0]
+            marker.pose.orientation.y = orientation[1]
+            marker.pose.orientation.z = orientation[2]
+            marker.pose.orientation.w = orientation[3]
+            marker.color.r=1
+            marker.color.a=0.6
+            marker.scale.x=0.1
+            marker.scale.y=0.1
+            marker.scale.z=0.1
+            self.markerArray.append(marker)
+        markerArray = MarkerArray()
+        markerArray.markers = self.markerArray
+        return markerArray          
+
+
 
 
 
@@ -248,7 +304,7 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
     else:
         
         points_3d = points_3d[points_3d[:, 2]<lowest_z-0.05] # anything greater than table height away from camera is probably the table
-
+    
     # Show pointcloud
     fig = plt.figure()
     ax = plt.axes(projection="3d")
@@ -261,6 +317,8 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
     camera_pose = lookup_transform(camera_frame, no_swap=True)
     homog = np.ones([points_3d.shape[0], 1])
     points_3d = np.matmul(camera_pose, np.concatenate([points_3d, homog], axis=-1).T ).T
+    lowest_point = np.argmax(points_3d[:, 2])
+    lowest_z = points_3d[lowest_point, 2]
 
 
     # points_3d = np.matmul(points_3d, camera_pose[:3, :3])
@@ -287,14 +345,16 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
         mesh_fn = lambda pose: trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
     elif obj_shape == "glass":
         object = trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)
-
-    particle_filter = ParticleFilter(10, pose, 0.1, mesh_fn=mesh_fn)
+    print(lowest_z)
+    particle_filter = ParticleFilter(10, pose, 0.1, mesh_fn=mesh_fn, min_z=lowest_z)
     return particle_filter
 
 # Uses moveit to move to the specified point and orientation (in base frame)
 # Inputs:
 #   - point: [x, y, z] np array 
 #   - orientation: [x, y, z, w] np array as quarternion
+# Outputs:
+#   - boolean for if it touched something
 def moveit_plan(point, orientation, speed=0.1, force_feedback=False):
     planner = PathPlanner('{}_arm'.format("right"))
     pose = Pose()
@@ -306,8 +366,14 @@ def moveit_plan(point, orientation, speed=0.1, force_feedback=False):
     plan = planner.plan_to_pose(pose)
     planner.execute_plan(plan, wait=not force_feedback)
     if force_feedback:
-        rospy.wait_for_message('force_resistance', Float32)
-        planner._group.stop()
+        try:
+            rospy.wait_for_message('force_resistance', Float32, timeout=10)
+            print("DETECTED TOUCH")
+            planner._group.stop()
+            return True
+        except ROSException as e:
+            print("NO TOUCH")
+            return False
     
 
 def execute_grasp(T_world_grasp, planner, gripper):
@@ -708,6 +774,7 @@ def parse_args():
 if __name__ == '__main__':
 
     rospy.init_node('dummy_tf_node')
+    publisher = rospy.Publisher("visualization_marker_array", MarkerArray)
     args = parse_args()
 
     # for USB cam
@@ -724,16 +791,29 @@ if __name__ == '__main__':
 
     # Get initial mesh guess and generate particle filter
     #mesh = do_multiview(camera_topic, camera_info, camera_frame, planner, gripper)
-    #particle_filter = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame, obj_shape=args.obj)
-
+    particle_filter = realsense_pointcloud(realsense_pointcloud_topic, realsense_camera_frame, obj_shape=args.obj)
     # Show mesh in vedo
-    #vedo.show([mesh], new=True)
+    vedo.show(particle_filter.particles, new=True)
+    markers = particle_filter.makeMarkers()
+    print("MARKERS WROPJQTJKOWEJT==--=--=-=-=-=", markers)
+    publisher.publish(markers)
 
     # Show mesh in rviz
+    while(True):
+        sorted_particles = particle_filter.sorted_particles()
+        best_particle = sorted_particles[0]
+        best_pose = best_particle.primitive.transform
+        point = best_pose[:3, -1]
+        #orientation = quaternion_from_matrix(best_pose[:3, :3])
+        orientation = np.array([0,1,0,0])
+        #point = np.array([0.712, 0.168, -0.117])
+        #orientation = np.array([0, 1, 0, 0])
+        touch = moveit_plan(point, orientation, force_feedback=True)
+        curr_pose = lookup_transform("right_gripper_tip")
+        particle_filter.reweight_particles(curr_pose, touch)
+        markers = particle_filter.makeMarkers()
+        publisher.publish()
 
-    point = np.array([0.712, 0.168, -0.117])
-    orientation = np.array([0, 1, 0, 0])
-    moveit_plan(point, orientation, force_feedback=True)
     # args = parse_args()
 
     # if args.debug:
