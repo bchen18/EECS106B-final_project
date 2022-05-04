@@ -50,7 +50,8 @@ class ParticleFilter:
         self.min_z=min_z
         # sample initial set of particles from initial guess
         self.particles = self.create_particles()
-        self.weights = [1/self.num_particles for _ in range(self.num_particles)]
+        self.weights = [1.0/self.num_particles for _ in range(self.num_particles)]
+        print("INITIAL WEIGHTS: ", self.weights)
         self.markerArray = []
         
     
@@ -62,6 +63,10 @@ class ParticleFilter:
             particles.append(sampled_particle)
         return particles
 
+    def sample_particles(self):
+        self.particles = self.create_particles()
+        self.weights = [1.0/self.num_particles for _ in range(self.num_particles)]
+
     def sample_particle(self, base_particle):
         # generate a uniformly random rotation
         rand_rot_perturb, _ = np.linalg.qr(np.random.randn(3, 3), mode='complete')
@@ -69,7 +74,7 @@ class ParticleFilter:
         curr_transform = deepcopy(base_particle.primitive.transform)
         curr_transform[:3, :3] = np.matmul(curr_transform[:3, :3], rand_rot_perturb)
         curr_transform[:3, -1] += rand_pos_perturb
-        curr_transform[3, -1] = max(self.min_z, curr_transform[3, -1])
+        curr_transform[2, -1] = max(self.min_z, curr_transform[2, -1])
         new_particle = self.mesh_fn(curr_transform)
         return new_particle
 
@@ -78,12 +83,15 @@ class ParticleFilter:
     
     def renormalize_weights(self):
         total_weight = sum(self.weights)
+        if total_weight == 0:
+            total_weight = 1
         #renormalize weights
         self.weights = [p / total_weight for p in self.weights]
 
     def sorted_particles(self):
         idxs = np.argsort(self.weights)
-        sorted_particles = np.array(self.particles)[idxs][::-1]
+        print("idxs: ", idxs)
+        sorted_particles = [self.particles[idx] for idx in idxs][::-1]
         return sorted_particles
 
     def reweight_particles(self, touch_pose, got_touched):
@@ -91,11 +99,13 @@ class ParticleFilter:
         touch_rot = touch_pose[:3, :3]
         for i, particle in enumerate(self.particles):
             point, dist, _ = trimesh.proximity.closest_point(particle, [touch_position])
+            dist = dist[0]
+            print("DIST", dist)
             if got_touched:
-                factor = np.log(1/dist)
+                factor = (1/dist) ** 0.2
             else:
-                factor = np.log(dist)
-            print("PARTICLE SIZE: ", len(self.particles), len(self.weights))
+                factor = dist ** 0.2
+            print("PARTICLE SIZE: ", len(self.particles), self.weights)
             self.reweight_particle(i, factor)
         self.renormalize_weights()
 
@@ -285,10 +295,17 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
     # Filter pointcloud to remove noise and table points
     points_3d = points_3d[points_3d[:, 2]<0.75] # anything greater than 0.75 meter away from camera is noise
     points_3d = points_3d[points_3d[:, 2]>0.2] # anything less than 0.2 meter from camera is also noise
+
+    # Transform points in pointcloud to base frame
+    camera_pose = lookup_transform(camera_frame, no_swap=True)
+    homog = np.ones([points_3d.shape[0], 1])
+    points_3d = np.matmul(camera_pose, np.concatenate([points_3d, homog], axis=-1).T ).T
+
     # Get "lowest" point which corresponds to table z coordinate, then remove points slightly above that to remove the table
     # this is trucky, may need a different way to remove the table
-    lowest_point = np.argmax(points_3d[:, 2])
-    highest_point = np.argmin(points_3d[:, 2])
+    median_z = np.mean(points_3d[:, 2])
+    lowest_point = np.argmin(points_3d[:, 2])
+    highest_point = np.argmax(points_3d[:, 2])
     lowest_z = points_3d[lowest_point, 2]
     print(lowest_z)
     # fig = plt.figure()
@@ -303,7 +320,7 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
         points_3d = points_3d[point_labels == highest_label]
     else:
         
-        points_3d = points_3d[points_3d[:, 2]<lowest_z-0.05] # anything greater than table height away from camera is probably the table
+        points_3d = points_3d[points_3d[:, 2]<lowest_z+0.05] # anything greater than table height away from camera is probably the table
     
     # Show pointcloud
     fig = plt.figure()
@@ -313,11 +330,8 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
     
     
 
-    # Transform points in pointcloud to base frame
-    camera_pose = lookup_transform(camera_frame, no_swap=True)
-    homog = np.ones([points_3d.shape[0], 1])
-    points_3d = np.matmul(camera_pose, np.concatenate([points_3d, homog], axis=-1).T ).T
-    lowest_point = np.argmax(points_3d[:, 2])
+    
+    lowest_point = np.argmin(points_3d[:, 2])
     lowest_z = points_3d[lowest_point, 2]
 
 
@@ -345,8 +359,8 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
         mesh_fn = lambda pose: trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
     elif obj_shape == "glass":
         object = trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)
-    print(lowest_z)
-    particle_filter = ParticleFilter(10, pose, 0.1, mesh_fn=mesh_fn, min_z=lowest_z)
+    print(median_z)
+    particle_filter = ParticleFilter(10, pose, 0.1, mesh_fn=mesh_fn, min_z=median_z+0.1)
     return particle_filter
 
 # Uses moveit to move to the specified point and orientation (in base frame)
@@ -367,7 +381,10 @@ def moveit_plan(point, orientation, speed=0.1, force_feedback=False):
     planner.execute_plan(plan, wait=not force_feedback)
     if force_feedback:
         try:
-            rospy.wait_for_message('force_resistance', Float32, timeout=10)
+            last_msg = 204600
+            while last_msg == 204600:
+                last_msg = rospy.wait_for_message('force_resistance', Float32, timeout=10).data
+                print("DETECTED POTENTIAL TOUCH")
             print("DETECTED TOUCH")
             planner._group.stop()
             return True
@@ -798,6 +815,9 @@ if __name__ == '__main__':
     print("MARKERS WROPJQTJKOWEJT==--=--=-=-=-=", markers)
     publisher.publish(markers)
 
+    init_point = np.array([0.712, 0.168, -0.117+0.5])
+    init_orientation = np.array([0, 1, 0, 0])
+
     # Show mesh in rviz
     while(True):
         sorted_particles = particle_filter.sorted_particles()
@@ -806,13 +826,19 @@ if __name__ == '__main__':
         point = best_pose[:3, -1]
         #orientation = quaternion_from_matrix(best_pose[:3, :3])
         orientation = np.array([0,1,0,0])
-        #point = np.array([0.712, 0.168, -0.117])
-        #orientation = np.array([0, 1, 0, 0])
-        touch = moveit_plan(point, orientation, force_feedback=True)
+        
+        touch = moveit_plan(point, orientation, force_feedback=True, speed=0.2)
         curr_pose = lookup_transform("right_gripper_tip")
         particle_filter.reweight_particles(curr_pose, touch)
+        particle_filter.renormalize_weights()
+        particle_filter.sample_particles()
+
+
+        x = raw_input("Start next loop? (Type something)")
         markers = particle_filter.makeMarkers()
-        publisher.publish()
+        publisher.publish(markers)
+        
+        moveit_plan(init_point, init_orientation, force_feedback=False, speed=0.2)
 
     # args = parse_args()
 
