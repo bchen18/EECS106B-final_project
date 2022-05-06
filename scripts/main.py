@@ -93,6 +93,17 @@ class ParticleFilter:
         print("idxs: ", idxs)
         sorted_particles = [self.particles[idx] for idx in idxs][::-1]
         return sorted_particles
+    
+    def center_particle(self):
+        best_particle = self.sorted_particles()[0]
+        mean_pos = np.array([0.0,0.0,0.0])
+        for i, particle in enumerate(self.particles):
+            mean_pos += self.weights[i] * particle.primitive.transform[:3, -1]
+        new_pose = np.zeros([4,4])
+        new_pose[:3, :3] = best_particle.primitive.transform[:3, :3]
+        new_pose[:3, -1] = mean_pos
+        new_pose[3, 3] =  1
+        return self.mesh_fn(new_pose)
 
     def reweight_particles(self, touch_pose, got_touched):
         touch_position = touch_pose[:3, -1]
@@ -357,10 +368,14 @@ def realsense_pointcloud(realsense_topic, camera_frame, use_kmeans=True, obj_sha
     elif obj_shape == "realsense":
         object = trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
         mesh_fn = lambda pose: trimesh.primitives.Box(extents=(0.0889, 0.1397, 0.0508), transform=pose)
+    elif obj_shape == "plentea":
+        object = trimesh.primitives.Box(extents=(0.0635, 0.1778, 0.0635), transform=pose)
+        mesh_fn = lambda pose: trimesh.primitives.Box(extents=(0.0635, 0.1778, 0.0635), transform=pose)
     elif obj_shape == "glass":
         object = trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)
+        mesh_fn = lambda pose: trimesh.primitives.Cylinder(radius=0.0762/2, height=0.12065, transform=pose)
     print(median_z)
-    particle_filter = ParticleFilter(10, pose, 0.1, mesh_fn=mesh_fn, min_z=median_z+0.1)
+    particle_filter = ParticleFilter(10, pose, 0.05, mesh_fn=mesh_fn, min_z=median_z+0.13)
     return particle_filter
 
 # Uses moveit to move to the specified point and orientation (in base frame)
@@ -382,9 +397,14 @@ def moveit_plan(point, orientation, speed=0.1, force_feedback=False):
     if force_feedback:
         try:
             last_msg = 204600
-            while last_msg == 204600:
+            start = time.time()
+            curr_time = start
+            while last_msg > 30000 and curr_time < start+10:
                 last_msg = rospy.wait_for_message('force_resistance', Float32, timeout=10).data
                 print("DETECTED POTENTIAL TOUCH")
+                curr_time = time.time()
+            if curr_time >= start + 10:
+                raise ROSException()
             print("DETECTED TOUCH")
             planner._group.stop()
             return True
@@ -752,7 +772,7 @@ def parse_args():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument('-obj', type=str, default='cube', help=
-        """Which Object you\'re trying to localize.  Options: cube, realsense, glass.  
+        """Which Object you\'re trying to localize.  Options: cube, realsense, glass, plentea  
         Default: cube"""
     )
     # parser.add_argument('-n_vert', type=int, default=1000, help=
@@ -822,13 +842,14 @@ if __name__ == '__main__':
     while(True):
         sorted_particles = particle_filter.sorted_particles()
         best_particle = sorted_particles[0]
+        #best_particle = particle_filter.center_particle()
         best_pose = best_particle.primitive.transform
         point = best_pose[:3, -1]
         #orientation = quaternion_from_matrix(best_pose[:3, :3])
         orientation = np.array([0,1,0,0])
         
         touch = moveit_plan(point, orientation, force_feedback=True, speed=0.2)
-        curr_pose = lookup_transform("right_gripper_tip")
+        curr_pose = lookup_transform("right_gripper_right_tip")
         particle_filter.reweight_particles(curr_pose, touch)
         particle_filter.renormalize_weights()
         particle_filter.sample_particles()
